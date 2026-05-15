@@ -1,0 +1,306 @@
+import os
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
+class UIEBDataset(Dataset):
+    def __init__(self, raw_dir, gt_dir):
+        self.raw_dir = raw_dir
+        self.gt_dir = gt_dir
+
+        raw_files = set(os.listdir(self.raw_dir))
+        gt_files = set(os.listdir(self.gt_dir))
+
+        self.image_names = sorted([
+            f for f in raw_files & gt_files
+            if f.endswith(('.jpg', '.png'))
+        ])
+
+        self.transform = A.Compose([
+            A.Resize(256, 256),
+            A.HorizontalFlip(p=0.5),
+        ])
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        name = self.image_names[idx]
+
+        raw = cv2.imread(os.path.join(self.raw_dir, name))
+        gt = cv2.imread(os.path.join(self.gt_dir, name))
+
+        if raw is None or gt is None:
+            raise ValueError(f"Error loading image: {name}")
+
+        raw = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+
+        augmented = self.transform(image=raw, mask=gt)
+        raw = augmented["image"]
+        gt = augmented["mask"]
+
+        raw = torch.tensor(raw).permute(2,0,1).float() / 255.0
+        gt = torch.tensor(gt).permute(2,0,1).float() / 255.0
+
+        return raw, gt
+
+RAW_PATH = "/kaggle/input/datasets/larjeck/uieb-dataset-raw/raw-890"
+REF_PATH = "/kaggle/input/datasets/larjeck/uieb-dataset-reference/reference-890"
+
+print("Raw:", len(os.listdir(RAW_PATH)))
+print("GT:", len(os.listdir(REF_PATH)))
+
+dataset = UIEBDataset(RAW_PATH, REF_PATH)
+print("Dataset size:", len(dataset))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 🔹 Conv Block
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# 🔹 Attention Block (FIXED)
+class AttentionBlock(nn.Module):
+    def __init__(self, g_ch, x_ch, inter_ch):
+        super().__init__()
+
+        self.W_g = nn.Sequential(
+            nn.Conv2d(g_ch, inter_ch, 1),
+            nn.BatchNorm2d(inter_ch)
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(x_ch, inter_ch, 1),
+            nn.BatchNorm2d(inter_ch)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_ch, 1, 1),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+
+        # 
+        g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
+
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+
+        return x * psi
+
+
+# 🔹 Up Block
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+        self.conv = ConvBlock(in_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
+
+
+# 🔹 Attention ResUNet
+class AttentionResUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.pool = nn.MaxPool2d(2)
+
+        # Encoder
+        self.e1 = ConvBlock(3, 64)
+        self.e2 = ConvBlock(64, 128)
+        self.e3 = ConvBlock(128, 256)
+        self.e4 = ConvBlock(256, 512)
+
+        # Bottleneck
+        self.b = ConvBlock(512, 1024)
+
+        # Attention Gates
+        self.a4 = AttentionBlock(1024, 512, 256)
+        self.a3 = AttentionBlock(512, 256, 128)
+        self.a2 = AttentionBlock(256, 128, 64)
+        self.a1 = AttentionBlock(128, 64, 32)
+
+        # Decoder
+        self.d4 = UpBlock(1024, 512)
+        self.d3 = UpBlock(512, 256)
+        self.d2 = UpBlock(256, 128)
+        self.d1 = UpBlock(128, 64)
+
+        # Output
+        self.out = nn.Conv2d(64, 3, 1)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.e1(x)                     # 256x256
+        e2 = self.e2(self.pool(e1))         # 128x128
+        e3 = self.e3(self.pool(e2))         # 64x64
+        e4 = self.e4(self.pool(e3))         # 32x32
+
+        # Bottleneck
+        b = self.b(self.pool(e4))           # 16x16
+
+        # Decoder with Attention
+        d4 = self.d4(b, self.a4(b, e4))     # 32x32
+        d3 = self.d3(d4, self.a3(d4, e3))   # 64x64
+        d2 = self.d2(d3, self.a2(d3, e2))   # 128x128
+        d1 = self.d1(d2, self.a1(d2, e1))   # 256x256
+
+        return torch.sigmoid(self.out(d1))
+#TRAINING SETUP
+import torch
+
+device = torch.device("cuda")
+
+model = AttentionResUNet().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+import torch.nn.functional as F
+
+def loss_fn(pred, target):
+    l1 = F.l1_loss(pred, target)
+    l2 = F.mse_loss(pred, target)
+
+    return 0.8 * l1 + 0.2 * l2
+
+#SSIM LOSS
+from torchmetrics.functional import structural_similarity_index_measure as ssim_loss
+
+def loss_fn(pred, target):
+    l1 = F.l1_loss(pred, target)
+    ssim_val = ssim_loss(pred, target)
+
+    return l1 + (1 - ssim_val)
+#LIPS LOSS
+import lpips
+lpips_loss = lpips.LPIPS(net='alex').to(device)
+
+def loss_fn(pred, target):
+    l1 = F.l1_loss(pred, target)
+    perceptual = lpips_loss(pred, target).mean()
+
+    return l1 + 0.3 * perceptual
+#TRAINING LOOP
+from torch.cuda.amp import GradScaler, autocast
+
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+scaler = GradScaler()
+
+EPOCHS = 40  
+
+for epoch in range(EPOCHS):
+    model.train()
+    epoch_loss = 0
+
+    for i, (raw, gt) in enumerate(train_loader):
+        raw = raw.to(device)
+        gt = gt.to(device)
+
+        with autocast():
+            pred = model(raw)
+            loss = loss_fn(pred, gt)
+
+        optimizer.zero_grad()
+
+        # BACKWARD
+        scaler.scale(loss).backward()
+
+        # ADD HERE (IMPORTANT)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        #  OPTIMIZER STEP
+        scaler.step(optimizer)
+        scaler.update()
+
+        epoch_loss += loss.item()
+
+        if i % 10 == 0:
+            print(f"Epoch {epoch+1}, Batch {i}, Loss: {loss.item():.4f}")
+
+    scheduler.step()
+
+    print(f" Epoch {epoch+1} DONE | Avg Loss: {epoch_loss/len(train_loader):.4f}")
+#EVALUATION
+def calculate_metrics(pred, gt):
+    pred = pred.permute(1,2,0).detach().numpy()
+    gt = gt.permute(1,2,0).detach().numpy()
+
+    return psnr(gt, pred, data_range=1.0), ssim(gt, pred, channel_axis=2, data_range=1.0)
+
+
+model.eval()
+total_psnr, total_ssim, count = 0, 0, 0
+
+with torch.no_grad():
+    for raw, gt in train_loader:
+        raw, gt = raw.to(device), gt.to(device)
+        pred = model(raw)
+
+        for i in range(raw.size(0)):
+            p, g = pred[i].cpu(), gt[i].cpu()
+            psnr_val, ssim_val = calculate_metrics(p, g)
+
+            total_psnr += psnr_val
+            total_ssim += ssim_val
+            count += 1
+
+print("PSNR:", total_psnr/count)
+print("SSIM:", total_ssim/count)
+
+#VISUAL
+raw, gt = dataset[10]
+
+with torch.no_grad():
+    pred = model(raw.unsqueeze(0).to(device))[0].cpu()
+
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.title("Raw")
+plt.imshow(raw.permute(1,2,0))
+plt.axis("off")
+
+plt.subplot(1,3,2)
+plt.title("myModel")
+plt.imshow(pred.permute(1,2,0))
+plt.axis("off")
+
+plt.subplot(1,3,3)
+plt.title("GT")
+plt.imshow(gt.permute(1,2,0))
+plt.axis("off")
+
+plt.show()
